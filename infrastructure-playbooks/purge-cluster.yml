@@ -199,13 +199,6 @@
       devices: []
     when: osd_scenario == "lvm"
 
-  - name: check for a device list
-    fail:
-      msg: "OSD automatic discovery was detected, purge cluster does not support this scenario. If you want to purge the cluster, manually provide the list of devices in group_vars/{{ osd_group_name }} using the devices variable."
-    when:
-      - devices|length == 0
-      - osd_auto_discovery|default(false)
-
   - name: get osd numbers
     shell: "if [ -d /var/lib/ceph/osd ] ; then ls /var/lib/ceph/osd | sed 's/.*-//' ; fi"
     register: osd_ids
@@ -324,20 +317,6 @@
     with_items: "{{ encrypted_ceph_partuuid.stdout_lines }}"
     when: "{{ encrypted_ceph_partuuid.stdout_lines | length > 0 }}"
 
-  - name: zap osd disks
-    shell: |
-      if (echo "{{ item }}" | grep -Esq '[0-9]{1,2}$'); then
-        raw_device=$(echo "{{ item }}" | grep -Eo '/dev/([hsv]d[a-z]{1,2}|cciss/c[0-9]d[0-9]|nvme[0-9]n[0-9]){1,2}')
-        partition_nb=$(echo "{{ item }}" | grep -Eo '[0-9]{1,2}$')
-        sgdisk --delete $partition_nb $raw_device
-      else
-        ceph-disk zap "{{ item }}"
-      fi
-    with_items: "{{ devices }}"
-    when:
-      - ceph_disk_present.rc == 0
-      - ceph_data_partlabels.rc == 0
-
   # this should go away once 'ceph-volume lvm zap' is available
   - name: remove osd logical volumes
     command: "lvremove -f {{ item.data_vg }}/{{ item.data }}"
@@ -356,23 +335,30 @@
       - osd_scenario == "lvm"
       - item.journal_vg is defined
 
+  - name: get ceph data partitions
+    shell: |
+      blkid | awk -F: '/ceph data/ { print $1 }'
+    when: ceph_data_partlabels.rc == 0
+    failed_when: false
+    register: ceph_data_partition_to_erase_path
+
   - name: get ceph journal partitions
     shell: |
-      blkid | awk '/ceph journal/ { sub (":", "", $1); print $1 }'
+      blkid | awk -F: '/ceph journal/ { print $1 }'
     when: ceph_journal_partlabels.rc == 0
     failed_when: false
     register: ceph_journal_partition_to_erase_path
 
   - name: get ceph db partitions
     shell: |
-      blkid | awk '/ceph block.db/ { sub (":", "", $1); print $1 }'
+      blkid | awk -F: '/ceph block.db/ { print $1 }'
     when: ceph_db_partlabels.rc == 0
     failed_when: false
     register: ceph_db_partition_to_erase_path
 
   - name: get ceph wal partitions
     shell: |
-      blkid | awk '/ceph block.wal/ { sub (":", "", $1); print $1 }'
+      blkid | awk -F: '/ceph block.wal/ { print $1 }'
     when: ceph_wal_partlabels.rc == 0
     failed_when: false
     register: ceph_wal_partition_to_erase_path
@@ -380,13 +366,13 @@
   - name: zap ceph journal partitions
     shell: |
       # if the disk passed is a raw device AND the boot system disk
-      if echo "{{ item }}" | egrep -sq '/dev/([hsv]d[a-z]{1,2}|cciss/c[0-9]d[0-9]p|nvme[0-9]n[0-9]p){1,2}$' && parted -s $(echo "{{ item }}" | egrep -o '/dev/([hsv]d[a-z]{1,2}|cciss/c[0-9]d[0-9]p|nvme[0-9]n[0-9]p){1,2}') print | grep -sq boot; then
+      if echo "{{ item }}" | egrep -sq '/dev/([hsv]d[a-z]{1,2}|xvd[a-z]{1,2}|cciss/c[0-9]d[0-9]p|nvme[0-9]n[0-9]p){1,2}$' && parted -s $(echo "{{ item }}" | egrep -o '/dev/([hsv]d[a-z]{1,2}|xvd[a-z]{1,2}|cciss/c[0-9]d[0-9]p|nvme[0-9]n[0-9]p){1,2}') print | grep -sq boot; then
         echo "Looks like {{ item }} has a boot partition,"
         echo "if you want to delete specific partitions point to the partition instead of the raw device"
         echo "Do not use your system disk!"
         exit 1
       fi
-      raw_device=$(echo "{{ item }}" | egrep -o '/dev/([hsv]d[a-z]{1,2}|cciss/c[0-9]d[0-9]|nvme[0-9]n[0-9]){1,2}')
+      raw_device=$(echo "{{ item }}" | egrep -o '/dev/([hsv]d[a-z]{1,2}|xvd[a-z]{1,2}|cciss/c[0-9]d[0-9]|nvme[0-9]n[0-9]){1,2}')
       partition_nb=$(echo "{{ item }}" | egrep -o '[0-9]{1,2}$')
       sgdisk --delete $partition_nb $raw_device
     with_items:
@@ -396,6 +382,23 @@
     when:
       - (ceph_journal_partlabels.rc == 0 or ceph_db_partlabels.rc == 0 or ceph_wal_partlabels.rc == 0)
       - osd_scenario == 'non-collocated'
+
+  # remove partition or zap disk if entire disk is being used
+
+  - name: zap osd disks
+    shell: |
+      if (echo "{{ item }}" | grep -Esq '[0-9]{1,2}$'); then
+        raw_device=$(echo "{{ item }}" | grep -Eo '/dev/([hsv]d[a-z]{1,2}|xvd[a-z]{1,2}|cciss/c[0-9]d[0-9]|nvme[0-9]n[0-9]){1,2}')
+        partition_nb=$(echo "{{ item }}" | grep -Eo '[0-9]{1,2}$')
+        sgdisk --delete $partition_nb $raw_device
+      else
+        ceph-disk zap "{{ item }}"
+      fi
+    with_items: "{{ ceph_data_partition_to_erase_path.stdout_lines | default([]) }}"
+    when:
+      - ceph_disk_present.rc == 0
+      - ceph_data_partlabels.rc == 0
+
 
 - name: purge ceph mon cluster
 
